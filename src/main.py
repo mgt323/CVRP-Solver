@@ -12,10 +12,20 @@ from datetime import datetime
 import statistics
 
 
+# --- Robust Path Definition ---
+try:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    base_results_dir = os.path.join(project_root, "results")
+except NameError:
+    print("Warning: Could not determine script directory. Using relative path '../results/'.")
+    base_results_dir = "../results/"
+# --- End Robust Path Definition ---
+
+
 class Logger:
     """Class for logging the progress of optimization algorithms."""
 
-    # ZMIANA: Konstruktor przyjmuje teraz docelowy katalog (folder serii)
     def __init__(self, directory: str, filename_base: str = "log_data"):
         self.data = []
         self.directory = directory # Przechowuje katalog serii
@@ -28,7 +38,7 @@ class Logger:
     def save(self, run_identifier: str):
         """
         Saves logged data to a CSV file inside the directory provided during initialization.
-        The filename is based on the run_identifier.
+        The filename is based on the run_identifier. Uses descriptive column names.
 
         Args:
             run_identifier (str): Identifier for the run (e.g., "run_1", "run_final").
@@ -40,12 +50,33 @@ class Logger:
         try:
             # Upewnij się, że folder istnieje (choć main powinien to zrobić)
             os.makedirs(self.directory, exist_ok=True)
-
             with open(filepath, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile, delimiter=';')
-                header = ['x_value', 'best_fitness']
-                if self.data and len(self.data[0]) > 2:
-                    header.extend([f'metric_{i}' for i in range(len(self.data[0]) - 2)])
+
+                header = []
+                if self.data:
+                    num_cols = len(self.data[0])
+                    # Podstawowe kolumny
+                    if num_cols >= 1:
+                        header.append('step')  # Bardziej ogólna nazwa dla generacji/iteracji
+                    if num_cols >= 2:
+                        header.append('best_so_far_fitness')  # Lepiej opisuje co jest logowane
+
+                    # Dodatkowe kolumny w zależności od algorytmu (wykrywane po liczbie kolumn)
+                    if num_cols == 3:
+                        # Prawdopodobnie Tabu Search (iteration, best_solution.fitness, current_solution.fitness)
+                        header.append('current_solution_fitness')
+                    elif num_cols == 4:
+                        # Prawdopodobnie Genetic Algorithm (generation, best_fitness, avg_population_fitness, worst_population_fitness)
+                        header.append('avg_population_fitness')
+                        header.append('worst_population_fitness')
+                    elif num_cols > 4:
+                        # Generyczny fallback dla większej liczby metryk
+                        header.extend([f'additional_metric_{i}' for i in range(num_cols - 2)])
+                else:
+                    # Domyślny nagłówek, jeśli brak danych
+                    header = ['step', 'best_so_far_fitness']
+
                 writer.writerow(header)
                 for row in self.data:
                     writer.writerow(row)
@@ -100,9 +131,10 @@ class Logger:
         # Przygotowanie danych do wykresu (z wypełnianiem braków)
         plot_x_values = []
         plot_best_star, plot_avg_of_bests, plot_worst_of_bests = [], [], []
+        plot_std_devs = []
         filled_aggregated_data = {}
-        last_known_bests = [None] * num_runs
 
+        last_known_bests = [None] * num_runs
         for x_val in range(max_x_value + 1):
             current_bests = aggregated_data.get(x_val)  # Pobierz dane dla x_val
             # Jeśli brak danych dla x_val, użyj ostatnio znanych
@@ -130,26 +162,41 @@ class Logger:
                 plot_best_star.append(min(valid_bests_at_x))
                 plot_avg_of_bests.append(statistics.mean(valid_bests_at_x))
                 plot_worst_of_bests.append(max(valid_bests_at_x))
+                if len(valid_bests_at_x) > 1:
+                    plot_std_devs.append(statistics.stdev(valid_bests_at_x))
+                else:
+                    plot_std_devs.append(0.0)  # Odchylenie = 0 dla pojedynczego punktu
 
         # Generowanie wykresu
         if not plot_x_values:
             print("No data points collected for the summary plot after processing.")
             return
-        plt.figure(figsize=(12, 7))
-        plt.plot(plot_x_values, plot_best_star, label='Best Overall Fitness (min across runs)', marker='.',
-                 linestyle='-', markersize=3)
-        plt.plot(plot_x_values, plot_avg_of_bests, label='Average Best Fitness (mean across runs)', marker='.',
-                 linestyle='-', markersize=3)
-        plt.plot(plot_x_values, plot_worst_of_bests, label='Worst Best Fitness (max across runs)', marker='.',
-                 linestyle='-', markersize=3)
+        plot_x_values_np = np.array(plot_x_values)
+        plot_avg_of_bests_np = np.array(plot_avg_of_bests)
+        plot_std_devs_np = np.array(plot_std_devs)
+        plt.figure(figsize=(12, 8))
+        # Linie Best* i Worst
+        plt.plot(plot_x_values_np, plot_best_star, label='Best Overall (min)', color='green', linestyle='--',
+                 linewidth=1)
+        plt.plot(plot_x_values_np, plot_worst_of_bests, label='Worst Best (max)', color='red', linestyle=':',
+                 linewidth=1)
+        # Linia Avg
+        # Użyj plot_x_values_np i plot_avg_of_bests_np
+        plt.plot(plot_x_values_np, plot_avg_of_bests_np, label='Average Best (mean)', color='blue', linewidth=1.5)
+        plt.fill_between(plot_x_values_np,
+                         plot_avg_of_bests_np - plot_std_devs_np,
+                         plot_avg_of_bests_np + plot_std_devs_np,
+                         color='blue',  # Kolor powiązany z linią średniej
+                         alpha=0.15,  # Przezroczystość
+                         label='Std Dev Range (avg ± std)')
         plt.xlabel(x_axis_label)
         plt.ylabel('Fitness (Best Solution)')
         plt.title(f'{title_suffix} ({num_runs} runs)')
-        plt.legend()
+        plt.legend(loc='best')
+        plt.grid(True, linestyle='--', alpha=0.6)
         plt.grid(True)
         date_str = datetime.today().strftime("%Y%m%d-%H%M%S")
-        random_suffix = random.randint(100, 999)
-        filepath = os.path.join(directory, f"{filename_prefix}_{date_str}_{random_suffix}.png")
+        filepath = os.path.join(directory, f"{filename_prefix}_{date_str}.png")
         try:
             plt.savefig(filepath)
             print(f"Summary plot saved to {filepath}")
@@ -157,7 +204,7 @@ class Logger:
             print(f"Error saving summary plot to {filepath}: {e}")
         plt.close()
 
-    # plot() dla indywidualnego wykresu - zapisuje w folderze przekazanym do konstruktora
+    # plot() dla indywidualnego wykresu — zapisuje w folderze przekazanym do konstruktora
     def plot(self, run_identifier: str = "individual_run"):
         """Plot the performance of a single algorithm run and save it."""
         if not self.data: return
@@ -1056,25 +1103,130 @@ class TabuSearch:
                 current_iter = iteration
                 tabu_list = {move: expiry for move, expiry in tabu_list.items() if expiry > current_iter}
 
-            # --- ZMIANA: Logowanie w każdej iteracji ---
+            # --- Logowanie w każdej iteracji ---
             self.logger.log(iteration, self.best_solution.fitness, current_solution.fitness)
-            # --- Koniec zmiany ---
 
-        # --- ZMIANA: Wyłącz indywidualne rysowanie wykresu ---
+        # --- Wyłącz indywidualne rysowanie wykresu ---
         # self.logger.save() # Zapis CSV może być nadal przydatny
         # self.logger.plot(f"Tabu Search ({self.problem.name}) - Run Result")
-        # --- Koniec zmiany ---
 
         return self.best_solution
 
 
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    base_results_dir = os.path.join(project_root, "results")
-except NameError:
-    print("Warning: Could not determine script directory. Using relative path '../results/'.")
-    base_results_dir = "../results/"
+def save_summary_report(report_data: Dict[str, Any], filepath: str):
+    """
+    Zapisuje zbiorczy raport z eksperymentu do pliku tekstowego.
+
+    Args:
+        report_data (Dict): Słownik zawierający dane do raportu.
+        filepath (str): Pełna ścieżka do pliku wyjściowego .txt.
+    """
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("--- EXPERIMENT SUMMARY ---\n\n")
+
+            # Informacje o Eksperymencie
+            f.write("--- Experiment Info ---\n")
+            exp_info = report_data.get("experiment", {})
+            f.write(f"Timestamp: {exp_info.get('timestamp', 'N/A')}\n")
+            f.write(f"Number of Runs per Algorithm: {exp_info.get('num_runs', 'N/A')}\n\n")
+
+            # Informacje o Problemie
+            f.write("--- Problem Info ---\n")
+            prob_info = report_data.get("problem", {})
+            f.write(f"Data File: {prob_info.get('data_file', 'N/A')}\n")
+            f.write(f"Name: {prob_info.get('name', 'N/A')}\n")
+            f.write(f"Dimension: {prob_info.get('dimension', 'N/A')}\n")
+            f.write(f"Capacity: {prob_info.get('capacity', 'N/A')}\n")
+            f.write(f"Depot Node (1-based): {prob_info.get('depot_index', 'N/A')}\n\n")
+
+            # --- Algorytm Genetyczny ---
+            f.write("--- Genetic Algorithm ---\n")
+            ga_data = report_data.get("ga", {})
+            # Parametry
+            f.write("Parameters:\n")
+            ga_params = ga_data.get("parameters", {})
+            if ga_params:
+                # Dodaj sortowanie dla spójności
+                for key, value in sorted(ga_params.items()):
+                    f.write(f"  {key}: {value}\n")
+            else:
+                f.write("  N/A\n")
+            # Wyniki
+            f.write("Results Summary (across runs):\n")
+            ga_results = ga_data.get("results", "N/A")
+            if isinstance(ga_results, dict):
+                # Użyj .get z domyślną wartością 'N/A' i formatuj tylko jeśli to liczba
+                bf = ga_results.get('best_overall_fitness', 'N/A')
+                af = ga_results.get('avg_best_fitness', 'N/A')
+                sf = ga_results.get('std_dev_best_fitness', 'N/A')
+                wf = ga_results.get('worst_of_bests_fitness', 'N/A')
+                at = ga_results.get('avg_time_seconds', 'N/A')
+                f.write(
+                    f"  Best Overall Fitness: {bf if isinstance(bf, (int, float)) else 'N/A'}\n")  # Usunięto formatowanie :.2f
+                f.write(
+                    f"  Avg Best Fitness: {af:.2f}\n" if isinstance(af, (int, float)) else "  Avg Best Fitness: N/A\n")
+                f.write(f"  Std Dev Best Fitness: {sf:.2f}\n" if isinstance(sf, (
+                int, float)) else "  Std Dev Best Fitness: N/A\n")
+                f.write(f"  Worst of Bests Fitness: {wf:.2f}\n" if isinstance(wf, (
+                int, float)) else "  Worst of Bests Fitness: N/A\n")
+                f.write(f"  Avg Execution Time (s): {at:.2f}\n" if isinstance(at, (
+                int, float)) else "  Avg Execution Time (s): N/A\n")
+            else:
+                f.write(f"  {ga_results}\n")
+            f.write("\n")
+
+            # --- Tabu Search ---
+            f.write("--- Tabu Search ---\n")
+            ts_data = report_data.get("ts", {})
+            # Parametry
+            f.write("Parameters:\n")
+            ts_params = ts_data.get("parameters", {})
+            if ts_params:
+                for key, value in sorted(ts_params.items()):
+                    f.write(f"  {key}: {value}\n")
+            else:
+                f.write("  N/A\n")
+            # Wyniki
+            f.write("Results Summary (across runs):\n")
+            ts_results = ts_data.get("results", "N/A")
+            if isinstance(ts_results, dict):
+                bf = ts_results.get('best_overall_fitness', 'N/A')
+                af = ts_results.get('avg_best_fitness', 'N/A')
+                sf = ts_results.get('std_dev_best_fitness', 'N/A')
+                wf = ts_results.get('worst_of_bests_fitness', 'N/A')
+                at = ts_results.get('avg_time_seconds', 'N/A')
+                f.write(f"  Best Overall Fitness: {bf if isinstance(bf, (int, float)) else 'N/A'}\n")
+                f.write(
+                    f"  Avg Best Fitness: {af:.2f}\n" if isinstance(af, (int, float)) else "  Avg Best Fitness: N/A\n")
+                f.write(f"  Std Dev Best Fitness: {sf:.2f}\n" if isinstance(sf, (
+                int, float)) else "  Std Dev Best Fitness: N/A\n")
+                f.write(f"  Worst of Bests Fitness: {wf:.2f}\n" if isinstance(wf, (
+                int, float)) else "  Worst of Bests Fitness: N/A\n")
+                f.write(f"  Avg Execution Time (s): {at:.2f}\n" if isinstance(at, (
+                int, float)) else "  Avg Execution Time (s): N/A\n")
+            else:
+                f.write(f"  {ts_results}\n")
+            f.write("\n")
+
+            # --- Algorytmy Referencyjne ---
+            f.write("--- Reference Solvers ---\n")
+            rs_data = report_data.get("random_solver", {})
+            gs_data = report_data.get("greedy_solver", {})
+            # Sprawdź, czy klucze istnieją przed formatowaniem
+            rs_bf = rs_data.get('best_fitness')
+            gs_bf = gs_data.get('best_fitness')
+            f.write(f"Random Solver (Best of {rs_data.get('num_samples', 'N/A')}): {rs_bf:.2f}\n" if isinstance(rs_bf, (
+            int, float)) else "Random Solver: N/A\n")
+            f.write(f"Greedy Solver (Best of all starts): {gs_bf:.2f}\n" if isinstance(gs_bf, (
+            int, float)) else "Greedy Solver: N/A\n")
+
+        print(f"Summary report saved to {filepath}")
+    except IOError as e:
+        print(f"Error writing summary report to {filepath}: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred while writing summary report: {e}")
+
 
 def main():
     # Load the problem
@@ -1082,17 +1234,17 @@ def main():
     data_file_name = "A-n32-k5.vrp"
     num_runs = 10
     ga_params = {
-        "population_size": 100,
+        "population_size": 250,
         "max_evaluations": 20000,
-        "crossover_rate": 0.7,
-        "mutation_rate": 0.2,
-        "tour_n": 5,
-        "elitism": 2
+        "crossover_rate": 0.5,
+        "mutation_rate": 0.1,
+        "tour_n": 3,
+        "elitism": 1
     }
     ts_params = {
-        "tabu_tenure": 15,
+        "tabu_tenure": 10,
         "max_iterations": 500,
-        "neighborhood_limit": 50
+        "neighborhood_limit": 25
     }
 
     data_file = os.path.join("..", "data", data_file_name)
@@ -1114,18 +1266,45 @@ def main():
     print(f"Capacity: {problem.capacity}")
     print(f"Depot: {problem.depot_index + 1}")
 
-    os.makedirs(base_results_dir, exist_ok=True)
 
-    ## --- Przygotowanie folderu dla serii GA ---
+    # --- Przygotowanie Folderów ---
+    os.makedirs(base_results_dir, exist_ok=True)  # Główny folder results
+
     timestamp_str = datetime.today().strftime("%Y%m%d-%H%M%S")
-    ga_series_folder_name = f"{problem.name}_GA_{timestamp_str}"
-    ga_series_folder_path = os.path.join(base_results_dir, ga_series_folder_name)
+    # 1. Folder Główny Uruchomienia
+    run_folder_name = f"{problem.name}_{timestamp_str}"
+    run_folder_path = os.path.join(base_results_dir, run_folder_name)
+
+    # 2. Podfoldery na indywidualne logi CSV
+    ga_csv_folder_path = os.path.join(run_folder_path, "GA_runs")
+    ts_csv_folder_path = os.path.join(run_folder_path, "TS_runs")
+
     try:
-        os.makedirs(ga_series_folder_path, exist_ok=True)
-        print(f"Created GA series folder: {ga_series_folder_path}")
+        # Utwórz folder główny i podfoldery
+        os.makedirs(run_folder_path, exist_ok=True)
+        os.makedirs(ga_csv_folder_path, exist_ok=True)
+        os.makedirs(ts_csv_folder_path, exist_ok=True)
+        print(f"Created main run folder: {run_folder_path}")
+        print(f"Created GA CSV subfolder: {ga_csv_folder_path}")
+        print(f"Created TS CSV subfolder: {ts_csv_folder_path}")
     except OSError as e:
-        print(f"Error creating GA series folder {ga_series_folder_path}: {e}")
-        ga_series_folder_path = base_results_dir # Fallback
+        print(f"Error creating results folders: {e}")
+        # W razie błędu można przerwać lub użyć ścieżek fallback
+        run_folder_path = base_results_dir
+        ga_csv_folder_path = base_results_dir
+        ts_csv_folder_path = base_results_dir
+    # --- Koniec Przygotowania Folderów ---
+
+    # ## --- Przygotowanie folderu dla serii GA ---
+    # timestamp_str = datetime.today().strftime("%Y%m%d-%H%M%S")
+    # ga_series_folder_name = f"{problem.name}_GA_{timestamp_str}"
+    # ga_series_folder_path = os.path.join(base_results_dir, ga_series_folder_name)
+    # try:
+    #     os.makedirs(ga_series_folder_path, exist_ok=True)
+    #     print(f"Created GA series folder: {ga_series_folder_path}")
+    # except OSError as e:
+    #     print(f"Error creating GA series folder {ga_series_folder_path}: {e}")
+    #     ga_series_folder_path = base_results_dir # Fallback
 
     # --- Genetic Algorithm Runs ---
     print(f"\nRunning Genetic Algorithm ({num_runs} runs)...")
@@ -1140,12 +1319,11 @@ def main():
 
         # --- Przekaż folder serii do konstruktora GA ---
         ga_params_run = ga_params.copy()
-        ga_params_run["log_directory"] = ga_series_folder_path
+        ga_params_run["log_directory"] = ga_csv_folder_path
         ga = GeneticAlgorithm(problem, **ga_params_run)
 
         ga_solution = ga.evolve()  # evolve nie powinno już zapisywać ani rysować
         ga_time = time.time() - start_time
-
         run_history = ga.logger.data
         ga_run_histories.append(run_history)
 
@@ -1169,7 +1347,7 @@ def main():
     if ga_run_histories:
         Logger.plot_summary(ga_run_histories,
                             filename_prefix=f"{problem.name}_ga_summary",
-                            directory=base_results_dir,
+                            directory=run_folder_path,
                             x_axis_label="Generation",
                             title_suffix=f"Genetic Algorithm ({problem.name})")
     else:
@@ -1194,15 +1372,15 @@ def main():
     else:
         print("\nGenetic Algorithm did not produce any valid results.")
 
-    # --- Przygotowanie folderu dla serii TS ---
-    ts_series_folder_name = f"{problem.name}_TS_{timestamp_str}"
-    ts_series_folder_path = os.path.join(base_results_dir, ts_series_folder_name)
-    try:
-        os.makedirs(ts_series_folder_path, exist_ok=True)
-        print(f"Created TS series folder: {ts_series_folder_path}")
-    except OSError as e:
-        print(f"Error creating TS series folder {ts_series_folder_path}: {e}")
-        ts_series_folder_path = base_results_dir  # Fallback
+    # # --- Przygotowanie folderu dla serii TS ---
+    # ts_series_folder_name = f"{problem.name}_TS_{timestamp_str}"
+    # ts_series_folder_path = os.path.join(base_results_dir, ts_series_folder_name)
+    # try:
+    #     os.makedirs(ts_series_folder_path, exist_ok=True)
+    #     print(f"Created TS series folder: {ts_series_folder_path}")
+    # except OSError as e:
+    #     print(f"Error creating TS series folder {ts_series_folder_path}: {e}")
+    #     ts_series_folder_path = base_results_dir  # Fallback
 
     # --- Tabu Search Runs ---
     print(f"\nRunning Tabu Search ({num_runs} runs)...")
@@ -1217,7 +1395,7 @@ def main():
 
         # --- Przekaż folder serii do konstruktora TS ---
         ts_params_run = ts_params.copy()
-        ts_params_run["log_directory"] = ts_series_folder_path
+        ts_params_run["log_directory"] = ts_csv_folder_path
         initial_sol_ts = None
         tabu_search = TabuSearch(problem, **ts_params_run)
 
@@ -1246,7 +1424,7 @@ def main():
     if ts_run_histories:
         Logger.plot_summary(ts_run_histories,
                             filename_prefix=f"{problem.name}_ts_summary",
-                            directory=base_results_dir,
+                            directory=run_folder_path,
                             x_axis_label="Iteration",
                             title_suffix=f"Tabu Search ({problem.name})")
     else:
@@ -1301,11 +1479,71 @@ def main():
     greedy_worst = max(greedy_results)
     greedy_avg = statistics.mean(greedy_results)
     greedy_std = statistics.stdev(greedy_results) if len(greedy_results) > 1 else 0
+    # Dodaj domyślne wartości na wszelki wypadek
+    random_best = random_best if 'random_best' in locals() else float('inf')
+    random_avg = random_avg if 'random_avg' in locals() else float('nan')
+    num_random_samples = num_random_samples if 'num_random_samples' in locals() else 0
+    greedy_best = greedy_best if 'greedy_best' in locals() else float('inf')
+    greedy_avg = greedy_avg if 'greedy_avg' in locals() else float('nan')
     print("Greedy Solver:")
     print(f"  Best (from all starts): {greedy_best:.2f}")
     print(f"  Worst (from all starts): {greedy_worst:.2f}")
     print(f"  Average (from all starts): {greedy_avg:.2f}")
     print(f"  Std Dev (from all starts): {greedy_std:.2f}")
+
+    # --- Zapis Zbiorczego Raportu ---
+    print("\n--- Generating Summary Report ---")
+
+    # Zbierz dane do raportu
+    summary_data = {
+        "problem": {
+            "name": problem.name,
+            "dimension": problem.dimension,
+            "capacity": problem.capacity,
+            "depot_index": problem.depot_index + 1,  # 1-based
+            # Upewnij się, że zmienna data_file istnieje w zasięgu
+            "data_file": data_file if 'data_file' in locals() else 'N/A'
+        },
+        "experiment": {
+            "timestamp": timestamp_str,  # timestamp_str zdefiniowany wcześniej
+            "num_runs": num_runs
+        },
+        "ga": {
+            "parameters": ga_params,  # Słownik parametrów GA
+            "results": {  # Wyniki GA, tylko jeśli były sukcesy
+                "best_overall_fitness": ga_best_overall,
+                "worst_of_bests_fitness": ga_worst_of_bests,
+                "avg_best_fitness": ga_avg_of_bests,
+                "std_dev_best_fitness": ga_std_dev,
+                "avg_time_seconds": ga_avg_time
+            } if ga_results_fitness else "No valid results"
+        },
+        "ts": {
+            "parameters": ts_params,  # Słownik parametrów TS
+            "results": {  # Wyniki TS, tylko jeśli były sukcesy
+                "best_overall_fitness": ts_best_overall,
+                "worst_of_bests_fitness": ts_worst_of_bests,
+                "avg_best_fitness": ts_avg_of_bests,
+                "std_dev_best_fitness": ts_std_dev,
+                "avg_time_seconds": ts_avg_time
+            } if ts_results_fitness else "No valid results"
+        },
+        "random_solver": {
+            "best_fitness": random_best,
+            "avg_fitness": random_avg,
+            "num_samples": num_random_samples
+        },
+        "greedy_solver": {
+            "best_fitness": greedy_best,
+            "avg_fitness": greedy_avg
+        }
+    }
+
+    # Zdefiniuj nazwę i ścieżkę pliku raportu
+    report_filename = f"{problem.name}_experiment_summary_{timestamp_str}.txt"
+    report_filepath = os.path.join(run_folder_path, report_filename)
+    save_summary_report(summary_data, report_filepath)
+    # --- Koniec Zapisu Raportu ---
 
     print("\nFinal Comparison (Best Found & Average Best):")
     print(f"  Random (Best of N): {random_best:.2f}")  # random_best zdefiniowane wcześniej
