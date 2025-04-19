@@ -26,10 +26,11 @@ except NameError:
 class Logger:
     """Class for logging the progress of optimization algorithms."""
 
-    def __init__(self, directory: str, filename_base: str = "log_data"):
+    def __init__(self, directory: str, algorithm_type: str, filename_base: str = "log_data"):
         self.data = []
         self.directory = directory # Przechowuje katalog serii
         self.filename_base = filename_base
+        self.algorithm_type = algorithm_type.upper()  # Zapisz typ (np. 'GA', 'TS')
 
     def log(self, x_value: int, best_fitness: float, *args):
         """Log statistics for a generation or iteration."""
@@ -56,26 +57,31 @@ class Logger:
                 header = []
                 if self.data:
                     num_cols = len(self.data[0])
-                    # Podstawowe kolumny
-                    if num_cols >= 1:
-                        header.append('step')  # Bardziej ogólna nazwa dla generacji/iteracji
-                    if num_cols >= 2:
-                        header.append('best_so_far_fitness')  # Lepiej opisuje co jest logowane
+                    if num_cols >= 1: header.append('step')
+                    if num_cols >= 2: header.append('best_so_far_fitness')
 
-                    # Dodatkowe kolumny w zależności od algorytmu (wykrywane po liczbie kolumn)
-                    if num_cols == 3:
-                        # Prawdopodobnie Tabu Search (iteration, best_solution.fitness, current_solution.fitness)
-                        header.append('current_solution_fitness')
-                    elif num_cols == 4:
-                        # Prawdopodobnie Genetic Algorithm (generation, best_fitness, avg_population_fitness, worst_population_fitness)
-                        header.append('avg_population_fitness')
-                        header.append('worst_population_fitness')
-                    elif num_cols > 4:
-                        # Generyczny fallback dla większej liczby metryk
-                        header.extend([f'additional_metric_{i}' for i in range(num_cols - 2)])
+                    # Ustaw nagłówki dla kolumn 3+ w zależności od typu i liczby kolumn
+                    if num_cols >= 3:
+                        if self.algorithm_type == 'GA':
+                            header.append('avg_population_fitness')
+                        elif self.algorithm_type == 'TS':
+                            header.append('current_solution_fitness')
+                        else:  # Fallback
+                            header.append('metric_1')
+
+                    if num_cols >= 4:
+                        if self.algorithm_type == 'GA':
+                            header.append('worst_population_fitness')
+                        elif self.algorithm_type == 'TS':
+                            header.append('worst_neighbor_fitness')  # Nowy nagłówek dla TS
+                        else:  # Fallback
+                            header.append('metric_2')
+
+                    # Obsługa dodatkowych, nieoczekiwanych kolumn
+                    if num_cols > 4:
+                        header.extend([f'additional_metric_{i}' for i in range(num_cols - 4)])
                 else:
-                    # Domyślny nagłówek, jeśli brak danych
-                    header = ['step', 'best_so_far_fitness']
+                    header = ['step', 'best_so_far_fitness']  # Domyślny dla pustych danych
 
                 writer.writerow(header)
                 for row in self.data:
@@ -105,67 +111,102 @@ class Logger:
             print("No run histories provided for summary plot.")
             return
         os.makedirs(directory, exist_ok=True)
-        aggregated_data: Dict[int, List[float]] = {}
+        aggregated_bests: Dict[int, List[float]] = {}
+        aggregated_worsts: Dict[int, List[float]] = {}
         max_x_value = 0
         num_runs = len(run_histories)
 
-        # Agregacja z obsługą potencjalnych błędów indeksowania
+        # 1. Agregacja danych
         for run_index, run_data in enumerate(run_histories):
             if not run_data: continue
             run_processed_x = set()
             for step_data in run_data:
                 try:
                     x_val = int(step_data[0])
-                    best_fitness = float(step_data[1])
                     if x_val in run_processed_x: continue
                     run_processed_x.add(x_val)
-                    if x_val not in aggregated_data:
-                        aggregated_data[x_val] = [None] * num_runs
-                    if run_index < num_runs:  # Dodatkowe zabezpieczenie
-                        aggregated_data[x_val][run_index] = best_fitness
+
+                    # --- Odczytuj różne kolumny ---
+                    best_fitness = float(step_data[1])  # Zawsze w kolumnie 1 (indeks)
+
+                    # Inicjalizuj listy, jeśli potrzebne
+                    if x_val not in aggregated_bests: aggregated_bests[x_val] = [None] * num_runs
+                    if x_val not in aggregated_worsts: aggregated_worsts[x_val] = [None] * num_runs  # Nawet jeśli nie GA, dla spójności
+
+                    # Zapisz best_fitness
+                    if run_index < num_runs: aggregated_bests[x_val][run_index] = best_fitness
+
+                    # Zapisz worst_fitness *tylko* jeśli to dane GA i mają 4 kolumny
+                    if len(step_data) >= 4:
+                        worst_pop_fitness = float(step_data[3])  # Kolumna 3 (indeks) dla GA
+                        if run_index < num_runs: aggregated_worsts[x_val][run_index] = worst_pop_fitness
+
                     max_x_value = max(max_x_value, x_val)
                 except (IndexError, ValueError, TypeError) as e:
                     print(f"Warning: Skipping invalid data point {step_data} in run {run_index}. Error: {e}")
-                    continue  # Pomiń błędny punkt
+                    continue
 
-        # Przygotowanie danych do wykresu (z wypełnianiem braków)
+        # 2. Przygotowanie danych do wykresu (z wypełnianiem braków)
         plot_x_values = []
-        plot_best_star, plot_avg_of_bests, plot_worst_of_bests = [], [], []
-        plot_std_devs = []
-        filled_aggregated_data = {}
+        plot_best_star, plot_avg_of_bests, plot_std_devs = [], [], []
+        plot_worst_overall = []  # Najgorszy z populacji GA
 
+        # Wypełnianie braków (forward fill) - osobno dla best i worst
+        filled_bests_data = {}
+        filled_worsts_data = {}
         last_known_bests = [None] * num_runs
+        last_known_worsts = [None] * num_runs  # Dla worst_population_fitness
+
         for x_val in range(max_x_value + 1):
-            current_bests = aggregated_data.get(x_val)  # Pobierz dane dla x_val
-            # Jeśli brak danych dla x_val, użyj ostatnio znanych
+            current_bests = aggregated_bests.get(x_val)
+            current_worsts = aggregated_worsts.get(x_val)  # Może być None jeśli nie GA lub brak danych
+
+            # Wypełnianie dla 'best'
             if current_bests is None:
-                if x_val > 0 and x_val - 1 in filled_aggregated_data:
-                    filled_bests = filled_aggregated_data[x_val - 1][:]  # Kopiuj poprzednie
-                else:
-                    filled_bests = [None] * num_runs  # Brak danych na początku
+                filled_b = filled_bests_data.get(x_val - 1, [None] * num_runs)[:]  # Kopia poprzednich
             else:
-                # Zaktualizuj ostatnio znane i wypełnij None
-                filled_bests = []
+                filled_b = []
                 for i in range(num_runs):
                     if i < len(current_bests) and current_bests[i] is not None:
                         last_known_bests[i] = current_bests[i]
-                        filled_bests.append(current_bests[i])
+                        filled_b.append(current_bests[i])
                     else:
-                        filled_bests.append(last_known_bests[i])  # Użyj ostatnio znanej
+                        filled_b.append(last_known_bests[i])
+            filled_bests_data[x_val] = filled_b
 
-            filled_aggregated_data[x_val] = filled_bests
+            # Wypełnianie dla 'worst'
+            if current_worsts is None:
+                filled_w = filled_worsts_data.get(x_val - 1, [None] * num_runs)[:]
+            else:
+                filled_w = []
+                for i in range(num_runs):
+                    if i < len(current_worsts) and current_worsts[i] is not None:
+                        last_known_worsts[i] = current_worsts[i]
+                        filled_w.append(current_worsts[i])
+                    else:
+                        filled_w.append(last_known_worsts[i])
+            filled_worsts_data[x_val] = filled_w
 
-            # Oblicz statystyki, jeśli są dostępne dane
-            valid_bests_at_x = [b for b in filled_bests if b is not None]
+            # Oblicz statystyki, jeśli są dostępne dane 'best'
+            valid_bests_at_x = [b for b in filled_b if b is not None]
             if valid_bests_at_x:
                 plot_x_values.append(x_val)
+                # Statystyki oparte na najlepszych wynikach (best*, avg, std)
                 plot_best_star.append(min(valid_bests_at_x))
                 plot_avg_of_bests.append(statistics.mean(valid_bests_at_x))
-                plot_worst_of_bests.append(max(valid_bests_at_x))
-                if len(valid_bests_at_x) > 1:
-                    plot_std_devs.append(statistics.stdev(valid_bests_at_x))
-                else:
-                    plot_std_devs.append(0.0)  # Odchylenie = 0 dla pojedynczego punktu
+                plot_std_devs.append(statistics.stdev(valid_bests_at_x) if len(valid_bests_at_x) > 1 else 0.0)
+
+                # --- Oblicz 'worst' z danych 'worst' (jeśli GA) ---
+                worst_value_to_plot = None
+                if x_val in filled_worsts_data:
+                    valid_worsts_at_x = [w for w in filled_worsts_data[x_val] if w is not None]
+                    if valid_worsts_at_x:
+                        worst_value_to_plot = max(valid_worsts_at_x)  # Max z najgorszych w populacjach GA
+
+                # Jeśli nie GA lub brak danych worst, nie dodawaj nic (linia będzie krótsza)
+                # lub dodaj np. NaN lub ostatnią znaną wartość worst, albo max(valid_bests_at_x)
+                # Dla spójności długości list, dodajmy NaN jeśli nie ma danych 'worst'
+                plot_worst_overall.append(worst_value_to_plot if worst_value_to_plot is not None else np.nan)
 
         # Generowanie wykresu
         if not plot_x_values:
@@ -174,12 +215,15 @@ class Logger:
         plot_x_values_np = np.array(plot_x_values)
         plot_avg_of_bests_np = np.array(plot_avg_of_bests)
         plot_std_devs_np = np.array(plot_std_devs)
+        plot_best_star_np = np.array(plot_best_star)
+        plot_worst_overall_np = np.array(plot_worst_overall)
         plt.figure(figsize=(12, 8))
         # Linie Best* i Worst
         plt.plot(plot_x_values_np, plot_best_star, label='Best Overall (min)', color='green', linestyle='--',
                  linewidth=1)
-        plt.plot(plot_x_values_np, plot_worst_of_bests, label='Worst Best (max)', color='red', linestyle=':',
-                 linewidth=1)
+        # Rysuj tylko tam, gdzie nie ma NaN
+        plt.plot(plot_x_values_np, plot_worst_overall_np, label='Worst Observed Fitness (max)',
+                 color='red', linestyle=':', linewidth=1)
         # Linia Avg
         # Użyj plot_x_values_np i plot_avg_of_bests_np
         plt.plot(plot_x_values_np, plot_avg_of_bests_np, label='Average Best (mean)', color='blue', linewidth=1.5)
@@ -524,7 +568,7 @@ class GeneticAlgorithm:
         self.tour_n = tour_n
         self.elitism = elitism
         log_filename_base = f"{self.problem.name}_ga_internal"
-        self.logger = Logger(directory=log_directory, filename_base=log_filename_base)
+        self.logger = Logger(directory=log_directory, algorithm_type='GA', filename_base=log_filename_base)
         self.population = []
         self.evaluations_count = 0
 
@@ -917,7 +961,7 @@ class TabuSearch:
         self.neighborhood_limit = neighborhood_limit # Zmiana
         self.best_solution = None
         log_filename_base = f"{self.problem.name}_ts_internal"
-        self.logger = Logger(directory=log_directory, filename_base=log_filename_base)
+        self.logger = Logger(directory=log_directory, algorithm_type='TS', filename_base=log_filename_base)
 
     def get_neighbors(self, solution: CVRPSolution) -> List[Tuple[CVRPSolution, Tuple]]:
         """Generate neighbors of a solution using swap and relocate moves."""
@@ -1031,19 +1075,35 @@ class TabuSearch:
 
         tabu_list: Dict[Tuple, int] = {}
 
-        # --- ZMIANA: Logowanie początkowego stanu ---
-        self.logger.log(0, self.best_solution.fitness, current_solution.fitness)
+        self.logger.log(0, self.best_solution.fitness, current_solution.fitness, current_solution.fitness)
 
         for iteration in range(1, self.max_iterations + 1):  # Pętla od 1 do max_iterations włącznie
             all_neighbors = self.get_neighbors(current_solution)
 
+            # --- Śledzenie najgorszego sąsiada ---
+            # Inicjalizuj najgorszego znanego - może to być bieżące rozwiązanie lub pierwszy sąsiad
+            worst_neighbor_fitness_in_iter = current_solution.fitness
+            if all_neighbors:
+                # Upewnij się, że pierwszy sąsiad ma obliczony fitness
+                first_neighbor_fitness = all_neighbors[0][0].fitness
+                if first_neighbor_fitness != float('inf'):
+                    worst_neighbor_fitness_in_iter = first_neighbor_fitness
+
+                # Przejrzyj WSZYSTKICH sąsiadów, aby znaleźć maksimum
+                for neighbor_solution, _ in all_neighbors:
+                    # Zakładamy, że get_neighbors zwróciło rozwiązania z obliczonym fitnessem
+                    if neighbor_solution.fitness != float('inf'):
+                        worst_neighbor_fitness_in_iter = max(worst_neighbor_fitness_in_iter, neighbor_solution.fitness)
+
+            # Zastosuj limit sąsiadów do dalszego rozważania (jeśli ustawiony)
             if self.neighborhood_limit is not None and len(all_neighbors) > self.neighborhood_limit:
                 considered_neighbors = random.sample(all_neighbors, self.neighborhood_limit)
             else:
-                considered_neighbors = all_neighbors
+                considered_neighbors = all_neighbors  # Rozważ wszystkich, jeśli limit nieaktywny lub za mała liczba sąsiadów
 
+            # Jeśli po limicie nie ma sąsiadów (limit=0?) lub ich nie wygenerowano
             if not considered_neighbors:
-                print(f"TS: No valid neighbors found at iteration {iteration}. Stopping.")
+                print(f"TS: No neighbors to consider at iteration {iteration}. Stopping.")
                 break
 
             best_neighbor = None
@@ -1104,7 +1164,10 @@ class TabuSearch:
                 tabu_list = {move: expiry for move, expiry in tabu_list.items() if expiry > current_iter}
 
             # --- Logowanie w każdej iteracji ---
-            self.logger.log(iteration, self.best_solution.fitness, current_solution.fitness)
+            self.logger.log(iteration,
+                            self.best_solution.fitness,  # Najlepszy znaleziony dotąd
+                            current_solution.fitness,  # Fitness bieżącego rozwiązania
+                            worst_neighbor_fitness_in_iter)  # Najgorszy fitness sąsiada w tej iteracji
 
         # --- Wyłącz indywidualne rysowanie wykresu ---
         # self.logger.save() # Zapis CSV może być nadal przydatny
@@ -1231,20 +1294,20 @@ def save_summary_report(report_data: Dict[str, Any], filepath: str):
 def main():
     # Load the problem
     problem = CVRPProblem()
-    data_file_name = "A-n32-k5.vrp"
+    data_file_name = "A-n39-k5.vrp"
     num_runs = 10
     ga_params = {
-        "population_size": 250,
-        "max_evaluations": 20000,
+        "population_size": 150,
+        "max_evaluations": 10000,
         "crossover_rate": 0.5,
-        "mutation_rate": 0.1,
+        "mutation_rate": 0.2,
         "tour_n": 3,
         "elitism": 1
     }
     ts_params = {
-        "tabu_tenure": 10,
-        "max_iterations": 500,
-        "neighborhood_limit": 25
+        "tabu_tenure": 20,
+        "max_iterations": 100,
+        "neighborhood_limit": 10
     }
 
     data_file = os.path.join("..", "data", data_file_name)
