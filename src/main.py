@@ -450,6 +450,12 @@ class CVRPSolution:
         for i, route in enumerate(self.routes):
             print(f"Route #{i + 1}: {' '.join(map(str, [idx + 1 for idx in route]))}")
 
+    def routes_to_string(self) -> str:
+        if not self.routes:
+            return "  No routes found."
+        # Dodajmy indeksowanie tras od 1 dla czytelności
+        return "\n".join([f"  - Route {i + 1}: {route}" for i, route in enumerate(self.routes)])
+
 
 class RandomSolver:
     """Class for generating random solutions to a CVRP instance."""
@@ -946,22 +952,28 @@ class GeneticAlgorithm:
 
 
 class TabuSearch:
-    """Class implementing Tabu Search for CVRP."""
-
     def __init__(self,
                  problem: CVRPProblem,
                  tabu_tenure: int = 20,
-                 max_iterations: int = 1000,
+                 # ZMIANA: max_iterations -> max_evaluations
+                 max_evaluations: int = 10000,  # Domyślna wartość, np. jak dla GA
                  neighborhood_limit: int = None,
-                 log_directory: str = "../results/"
+                 log_directory: str = "../results/",
+                 algorithm_type: str = 'TS'  # Dodane dla spójności z GA
                  ):
         self.problem = problem
         self.tabu_tenure = tabu_tenure
-        self.max_iterations = max_iterations
-        self.neighborhood_limit = neighborhood_limit # Zmiana
+        # ZMIANA: Przechowaj max_evaluations
+        self.max_evaluations = max_evaluations
+        self.neighborhood_limit = neighborhood_limit
         self.best_solution = None
+        # ZMIANA: Dodaj licznik ewaluacji
+        self.evaluations_count = 0
+
         log_filename_base = f"{self.problem.name}_ts_internal"
-        self.logger = Logger(directory=log_directory, algorithm_type='TS', filename_base=log_filename_base)
+        self.logger = Logger(directory=log_directory,
+                             algorithm_type=algorithm_type,
+                             filename_base=log_filename_base)
 
     def get_neighbors(self, solution: CVRPSolution) -> List[Tuple[CVRPSolution, Tuple]]:
         """Generate neighbors of a solution using swap and relocate moves."""
@@ -1063,116 +1075,109 @@ class TabuSearch:
         return neighbors
 
     def solve(self, initial_solution: CVRPSolution = None) -> CVRPSolution:
+        self.evaluations_count = 0  # Resetuj licznik na starcie solve
+
         if initial_solution is None:
             greedy_solver = GreedySolver(self.problem)
             current_solution = greedy_solver.solve()
         else:
             current_solution = initial_solution.copy()
 
-        # Upewnij się, że rozwiązania mają obliczony fitness
-        if current_solution.fitness == float('inf'): current_solution.evaluate()
-        self.best_solution = current_solution.copy()
+        if current_solution.fitness == float('inf'):
+            current_solution.evaluate()
+        # ZMIANA: Zlicz ewaluację rozwiązania początkowego
+        self.evaluations_count += 1
 
+        self.best_solution = current_solution.copy()
         tabu_list: Dict[Tuple, int] = {}
 
+        # Loguj stan początkowy
+        # Ostatni parametr to 'worst_neighbor_fitness', na początku można dać current_solution.fitness
         self.logger.log(0, self.best_solution.fitness, current_solution.fitness, current_solution.fitness)
 
-        for iteration in range(1, self.max_iterations + 1):  # Pętla od 1 do max_iterations włącznie
-            all_neighbors = self.get_neighbors(current_solution)
+        iteration = 0  # Licznik iteracji nadal potrzebny dla tenure i logowania
+        # ZMIANA: Główna pętla oparta na evaluations_count
+        while self.evaluations_count < self.max_evaluations:
+            iteration += 1  # Inkrementuj iterację na początku pętli
 
-            # --- Śledzenie najgorszego sąsiada ---
-            # Inicjalizuj najgorszego znanego - może to być bieżące rozwiązanie lub pierwszy sąsiad
+            # Sprawdź budżet ewaluacji PRZED generowaniem sąsiadów,
+            # aby uniknąć znacznego przekroczenia limitu w ostatniej iteracji.
+            if self.evaluations_count >= self.max_evaluations:
+                # print(f"TS: Max evaluations ({self.max_evaluations}) reached before iter {iteration}. Stopping.")
+                break
+
+            all_neighbors_data = self.get_neighbors(current_solution)  # Lista (solution, move)
+
+            # ZMIANA: Zlicz ewaluacje dla wszystkich wygenerowanych sąsiadów
+            # Zakładamy, że get_neighbors tworzy NOWE obiekty rozwiązań i je ocenia.
+            # Jeśli get_neighbors zwraca puste, nic nie dodajemy.
+            self.evaluations_count += len(all_neighbors_data)
+
             worst_neighbor_fitness_in_iter = current_solution.fitness
-            if all_neighbors:
-                # Upewnij się, że pierwszy sąsiad ma obliczony fitness
-                first_neighbor_fitness = all_neighbors[0][0].fitness
+            if all_neighbors_data:
+                first_neighbor_fitness = all_neighbors_data[0][0].fitness
                 if first_neighbor_fitness != float('inf'):
                     worst_neighbor_fitness_in_iter = first_neighbor_fitness
-
-                # Przejrzyj WSZYSTKICH sąsiadów, aby znaleźć maksimum
-                for neighbor_solution, _ in all_neighbors:
-                    # Zakładamy, że get_neighbors zwróciło rozwiązania z obliczonym fitnessem
+                for neighbor_solution, _ in all_neighbors_data:
                     if neighbor_solution.fitness != float('inf'):
                         worst_neighbor_fitness_in_iter = max(worst_neighbor_fitness_in_iter, neighbor_solution.fitness)
 
-            # Zastosuj limit sąsiadów do dalszego rozważania (jeśli ustawiony)
-            if self.neighborhood_limit is not None and len(all_neighbors) > self.neighborhood_limit:
-                considered_neighbors = random.sample(all_neighbors, self.neighborhood_limit)
+            # Zastosuj neighborhood_limit
+            if self.neighborhood_limit is not None and len(all_neighbors_data) > self.neighborhood_limit:
+                considered_neighbors = random.sample(all_neighbors_data, self.neighborhood_limit)
             else:
-                considered_neighbors = all_neighbors  # Rozważ wszystkich, jeśli limit nieaktywny lub za mała liczba sąsiadów
+                considered_neighbors = all_neighbors_data
 
-            # Jeśli po limicie nie ma sąsiadów (limit=0?) lub ich nie wygenerowano
             if not considered_neighbors:
-                print(f"TS: No neighbors to consider at iteration {iteration}. Stopping.")
+                # print(f"TS: No neighbors to consider at iter {iteration}, evals {self.evaluations_count}. Stopping.")
                 break
 
-            best_neighbor = None
+                # Wybór najlepszego dopuszczalnego sąsiada
+            best_neighbor_candidate = None  # Zmieniono nazwę, aby uniknąć konfliktu
             best_neighbor_fitness = float('inf')
             best_move = None
             found_admissible = False
 
-            for neighbor, move in considered_neighbors:
-                is_tabu = move in tabu_list and tabu_list[move] > iteration
+            for neighbor, move_tuple in considered_neighbors:  # Zmieniono nazwę zmiennej
+                is_tabu = move_tuple in tabu_list and tabu_list[move_tuple] > iteration
                 aspiration_met = is_tabu and neighbor.fitness < self.best_solution.fitness
-
                 if (not is_tabu) or aspiration_met:
                     if neighbor.fitness < best_neighbor_fitness:
-                        best_neighbor = neighbor
+                        best_neighbor_candidate = neighbor
                         best_neighbor_fitness = neighbor.fitness
-                        best_move = move
+                        best_move = move_tuple
                         found_admissible = True
 
-            # Obsługa sytuacji braku dopuszczalnego ruchu
             if not found_admissible:
-                # Zamiast przerywać, można wybrać najlepszego sąsiada (nawet tabu), jeśli nie ma aspiracji
-                if not best_neighbor:  # Jeśli żaden sąsiad nie został wybrany (nawet tabu)
-                    print(
-                        f"TS: No improving or non-tabu neighbor found at iteration {iteration}. Selecting best tabu neighbor (if any).")
-                    # Wybierz najlepszego sąsiada (nawet jeśli jest tabu i nie spełnia kryterium aspiracji)
-                    # To pozwala algorytmowi kontynuować, potencjalnie pogarszając rozwiązanie
+                if considered_neighbors:  # Jeśli byli jacyś sąsiedzi do rozważenia
                     neighbors_sorted = sorted(considered_neighbors, key=lambda item: item[0].fitness)
-                    if neighbors_sorted:
-                        best_neighbor = neighbors_sorted[0][0]  # Weź najlepszego sąsiada
-                        best_move = neighbors_sorted[0][1]  # i jego ruch
-                        print(f"TS: Selected best (potentially tabu) neighbor with fitness {best_neighbor.fitness:.2f}")
-                    else:  # To nie powinno się zdarzyć, jeśli considered_neighbors nie było puste
-                        print(f"TS: No neighbors available at all at iteration {iteration}. Stopping.")
-                        break
-                        # Jeśli best_neighbor został znaleziony (np. przez aspirację), kontynuuj normalnie
-                elif not best_move:  # Jeśli best_neighbor jest, ale best_move nie (nie powinno się zdarzyć)
-                    print(f"TS: Logic error - best_neighbor found but no best_move at iter {iteration}. Stopping.")
+                    best_neighbor_candidate = neighbors_sorted[0][0]
+                    best_move = neighbors_sorted[0][1]
+                else:  # To nie powinno się zdarzyć, jeśli all_neighbors_data nie było puste i limit > 0
+                    # print(f"TS: No neighbors considered and no admissible found at iter {iteration}, evals {self.evaluations_count}. Stopping.")
                     break
 
-            # Jeśli nadal nie ma sąsiada (np. gdy considered_neighbors było puste i neighbors_sorted też)
-            if best_neighbor is None:
-                print(f"TS: No neighbor could be selected at iteration {iteration}. Stopping.")
+            if best_neighbor_candidate is None:
+                # print(f"TS: No neighbor could be selected at iter {iteration}, evals {self.evaluations_count}. Stopping.")
                 break
 
-            # Aktualizacja
-            current_solution = best_neighbor
-
-            # Aktualizacja najlepszego globalnego
+            current_solution = best_neighbor_candidate  # Aktualizacja bieżącego rozwiązania
             if current_solution.fitness < self.best_solution.fitness:
                 self.best_solution = current_solution.copy()
-                # print(f"TS Iter {iteration}: New best found: {self.best_solution.fitness:.2f}") # Opcjonalny log
 
-            # Zarządzanie listą tabu
             if best_move:
                 tabu_list[best_move] = iteration + self.tabu_tenure
             if iteration % 50 == 0:
-                current_iter = iteration
-                tabu_list = {move: expiry for move, expiry in tabu_list.items() if expiry > current_iter}
+                current_iter_val = iteration  # Unikaj nadpisywania wbudowanej funkcji
+                tabu_list = {mv: expiry for mv, expiry in tabu_list.items() if expiry > current_iter_val}
 
-            # --- Logowanie w każdej iteracji ---
+            # Logowanie - używamy 'iteration' dla osi X, ale pętla jest kontrolowana przez 'evaluations_count'
             self.logger.log(iteration,
-                            self.best_solution.fitness,  # Najlepszy znaleziony dotąd
-                            current_solution.fitness,  # Fitness bieżącego rozwiązania
-                            worst_neighbor_fitness_in_iter)  # Najgorszy fitness sąsiada w tej iteracji
+                            self.best_solution.fitness,
+                            current_solution.fitness,
+                            worst_neighbor_fitness_in_iter)
 
-        # --- Wyłącz indywidualne rysowanie wykresu ---
-        # self.logger.save() # Zapis CSV może być nadal przydatny
-        # self.logger.plot(f"Tabu Search ({self.problem.name}) - Run Result")
-
+        # print(f"TS: Finished after {iteration} iterations, {self.evaluations_count} evaluations.")
         return self.best_solution
 
 
@@ -1235,6 +1240,9 @@ def save_summary_report(report_data: Dict[str, Any], filepath: str):
                 int, float)) else "  Worst of Bests Fitness: N/A\n")
                 f.write(f"  Avg Execution Time (s): {at:.2f}\n" if isinstance(at, (
                 int, float)) else "  Avg Execution Time (s): N/A\n")
+                f.write("Best Overall Solution Found (Routes):\n")
+                f.write(f"{ga_data.get('best_solution_routes', '  N/A')}\n")
+                f.write("\n")
             else:
                 f.write(f"  {ga_results}\n")
             f.write("\n")
@@ -1268,6 +1276,9 @@ def save_summary_report(report_data: Dict[str, Any], filepath: str):
                 int, float)) else "  Worst of Bests Fitness: N/A\n")
                 f.write(f"  Avg Execution Time (s): {at:.2f}\n" if isinstance(at, (
                 int, float)) else "  Avg Execution Time (s): N/A\n")
+                f.write("Best Overall Solution Found (Routes):\n")
+                f.write(f"{ts_data.get('best_solution_routes', '  N/A')}\n")
+                f.write("\n")
             else:
                 f.write(f"  {ts_results}\n")
             f.write("\n")
@@ -1295,10 +1306,11 @@ def main():
     # Load the problem
     problem = CVRPProblem()
     data_file_name = "A-n39-k5.vrp"
-    num_runs = 10
+    num_runs = 1
+    shared_max_evaluations = 20000
     ga_params = {
         "population_size": 150,
-        "max_evaluations": 10000,
+        "max_evaluations": shared_max_evaluations,
         "crossover_rate": 0.5,
         "mutation_rate": 0.2,
         "tour_n": 3,
@@ -1306,7 +1318,7 @@ def main():
     }
     ts_params = {
         "tabu_tenure": 20,
-        "max_iterations": 100,
+        "max_evaluations": shared_max_evaluations,
         "neighborhood_limit": 10
     }
 
@@ -1432,6 +1444,7 @@ def main():
         if best_ga_solution:
             print("  Best GA Solution found:")
             best_ga_solution.display()
+            ga_best_routes_str = best_ga_solution.routes_to_string()
     else:
         print("\nGenetic Algorithm did not produce any valid results.")
 
@@ -1509,6 +1522,7 @@ def main():
         if best_ts_solution:
             print("  Best TS Solution found:")
             best_ts_solution.display()
+            ts_best_routes_str = best_ts_solution.routes_to_string()
     else:
         print("\nTabu Search did not produce any valid results.")
 
@@ -1579,7 +1593,8 @@ def main():
                 "avg_best_fitness": ga_avg_of_bests,
                 "std_dev_best_fitness": ga_std_dev,
                 "avg_time_seconds": ga_avg_time
-            } if ga_results_fitness else "No valid results"
+            } if ga_results_fitness else "No valid results",
+            "best_solution_routes": ga_best_routes_str
         },
         "ts": {
             "parameters": ts_params,  # Słownik parametrów TS
@@ -1589,7 +1604,8 @@ def main():
                 "avg_best_fitness": ts_avg_of_bests,
                 "std_dev_best_fitness": ts_std_dev,
                 "avg_time_seconds": ts_avg_time
-            } if ts_results_fitness else "No valid results"
+            } if ts_results_fitness else "No valid results",
+            "best_solution_routes": ts_best_routes_str
         },
         "random_solver": {
             "best_fitness": random_best,
